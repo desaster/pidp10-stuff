@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+#
+# control script for pidp10 intended for use with systemd
+#
+# Based on pdpcontrol from the official PiDP-10 repository::
+# https://github.com/obsolescence/pidp10/blob/master/bin/pdpcontrol.sh
+#
+# Snippets taken from original author: Mark G Thomas <mark@misty.com> 2015-05-09
+#
+#
+# TODO: chaosbridge, tv11 should become systemd services too
+#
+
+set -e
+
+# check that we are not running as root:
+if [ $(id -u) -eq 0 ]; then
+    echo "This command should not be run as root"
+    exit 89
+fi
+
+pidp10="/opt/pidp10/bin/pidp10"
+pidp_dir=$(dirname $pidp10)
+pidp_bin=$(basename $pidp10)
+
+# read settings from file
+if [ -f /etc/default/pdpmgr ]; then
+  . /etc/default/pdpmgr
+fi
+
+# default values for the settings
+PIDP10_SESSION_PROGRAM="${PIDP10_SESSION_PROGRAM:-screen}"
+
+PIDP10_TMUX_SESSION="${PIDP10_TMUX_SESSION:-pidp10}"
+PIDP10_TMUX_WINDOW="${PIDP10_TMUX_WINDOW:-simh}"
+PIDP10_USE_CONSOLE="${PIDP10_USE_CONSOLE:-1}"
+
+# figure out which session management program to use
+case "$PIDP10_SESSION_PROGRAM" in
+    screen)
+        sess_bin="/usr/bin/screen"
+        ;;
+    tmux)
+        sess_bin="/usr/bin/tmux"
+        ;;
+    dtach)
+        sess_bin="/usr/bin/dtach"
+        ;;
+    *)
+        >&2 echo "invalid value for PIDP10_SESSION_PROGRAM"
+        exit 98
+        ;;
+esac
+
+# ensure the session management program is installed
+test -x "$sess_bin" || ( >&2 echo "$PIDP10_SESSION_PROGRAM not found" && exit 2 )
+
+# ensure the simulation binary is installed
+test -x $pidp10 || ( >&2 echo "pidp10 not found" && exit 97 )
+
+# check if simulation is running
+is_running() {
+    case "$PIDP10_SESSION_PROGRAM" in
+        screen)
+            screen -ls | egrep -q '[0-9]+\.pidp10'
+            ;;
+        tmux)
+            tmux has-session -t "$PIDP10_TMUX_SESSION:$PIDP10_TMUX_WINDOW" 2>/dev/null
+            ;;
+        dtach)
+            [ -e /tmp/dtach.pidp10 ]
+            ;;
+        *)
+            >&2 echo "Not implemented!"
+            exit 96
+    esac
+}
+
+# start simulation
+do_start() {
+    if is_running; then
+        >&2 echo "PiDP-10 is already running, not starting again."
+        exit 95
+    fi
+
+    file_extension=".pi"
+    if [ "$PIDP10_USE_CONSOLE" == "1" ] || "$PIDP10_USE_CONSOLE" == "yes" ]
+    then
+        file_extension=".pidp"
+    fi
+    >&2 echo "File extension: $file_extension"
+
+    # read current sel from /opt/pidp10/systems/current
+    sel=`cat /opt/pidp10/systems/current`
+    if [ "$sel" == "" ]
+    then
+        >&2 echo "No system selected, aborting".
+        exit 98
+    fi
+
+    if [ "$sel" = "scansw" ]
+    then
+        # read switch setting
+        boot_number=$(/opt/pidp10/bin/scansw10; echo -n $?)
+        sys=`printf "%04o" $boot_number`
+
+        # figure out system name from boot number
+        sel=`awk '$1 == '$sys' { sys = $2; exit } END { if(sys) print sys; else print "hills-blinky" }' \
+            < /opt/pidp10/systems/selections`
+
+        # TODO: these should not just for scansw:
+        if [ "$boot_number" -ge 16 ]; then
+            pidp_bin="pdp10-ki"
+        fi
+        if [ "$boot_number" -ge 64 ]; then
+            pidp_bin="pdp10-kl"
+        fi
+
+        >&2 echo "Switch selection $sys -> $sel ($pidp_bin)"
+    fi
+
+    if [[ -z "$sel" ]]; then
+        >&2 echo "No system selected, aborting".
+        echo 97
+    fi
+
+    if [ ! -d "/opt/pidp10/systems/$sel" ]
+    then
+        >&2 echo "Selected system \"$sel\" not found, aborting".
+        exit 96
+    fi
+
+    bootscript="/opt/pidp10/systems/$sel/boot$file_extension"
+
+    if ! validate_bootscript $bootscript
+    then
+        >&2 echo "Boot script validation failed"
+        exit 90
+    fi
+
+    if [[ ! -f "$bootscript" ]]; then
+        >&2 echo "Boot script \"$bootscript\" not found, aborting".
+        exit 91
+    fi
+
+    >&2 echo "Starting PiDP-10 with boot option \"$sel\" using $PIDP10_SESSION_PROGRAM"
+    cd $pidp_dir
+    case "$PIDP10_SESSION_PROGRAM" in
+        screen)
+            # TODO: support existing sessions here, just like with tmux?
+            screen -dmS pidp10 ./$pidp_bin "$bootscript"
+            ;;
+        tmux)
+            # no session?
+            if ! tmux has-session -t "$PIDP10_TMUX_SESSION" 2>/dev/null; then
+                tmux new-session \
+                    -d \
+                    -s "$PIDP10_TMUX_SESSION" \
+                    -n "$PIDP10_TMUX_WINDOW" \
+                    ./$pidp_bin "$bootscript"
+            # session exists, but no window?
+            elif ! tmux list-windows -t "$PIDP10_TMUX_SESSION" | grep -q "$PIDP10_TMUX_WINDOW"; then
+                tmux new-window \
+                    -t "$PIDP10_TMUX_SESSION" \
+                    -n "$PIDP10_TMUX_WINDOW" \
+                    ./$pidp_bin "$bootscript"
+            else
+                >&2 echo "Tmux session already running"
+                exit 95
+            fi
+            ;;
+        dtach)
+            dtach -n /tmp/dtach.pidp10 ./$pidp_bin "$bootscript"
+            ;;
+        *)
+            >&2 echo "Not implemented!"
+            exit 94
+    esac
+}
+
+do_stop_screen () {
+    expect <<EOF
+set timeout 3
+set screen_session "pidp10"
+spawn screen -x \$screen_session
+sleep 1
+send "\x05"
+sleep 1
+# send second CTRL-E for script-in-script problem on naked Pis
+send "\x05"
+sleep 1
+# --------------
+send "exit\r"
+sleep 2
+
+# leave the screen session
+#send "\x1D"
+#expect "Detached"
+exit
+EOF
+
+    echo screen -S pidp10 -X quit
+
+    # maybe let's not be this harsh:
+    # or, find a way to kill the actual pid with certainity
+    #pkill -9 pidp10
+}
+
+do_stop_tmux () {
+    tmux send-keys -t "$PIDP10_TMUX_SESSION:$PIDP10_TMUX_WINDOW" C-e
+    sleep 1
+    tmux send-keys -t "$PIDP10_TMUX_SESSION:$PIDP10_TMUX_WINDOW" exit Enter
+    sleep 1
+
+    tmux kill-window -t "$PIDP10_TMUX_SESSION:$PIDP10_TMUX_WINDOW"
+}
+
+do_stop_dtach () {
+    if [ ! -S "/tmp/dtach.pidp10" ]; then
+        >&2 echo "No dtach socket found"
+        exit 93
+    fi
+
+    # send input to the simh instance to stop it
+    echo -e "\x05" | dtach -p /tmp/dtach.pidp10 # ctrl-e
+    sleep 1
+    echo "exit" | dtach -p /tmp/dtach.pidp10 # exit simh
+
+    # simh should now be closing
+
+    # wait 10 seconds for /tmp/dtach.pidp10 to disappear,
+    # otherwise show error
+    for i in {1..10}; do
+        if [ ! -S "/tmp/dtach.pidp10" ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    # did dtach close properly?
+    if [ -S "/tmp/dtach.pidp10" ]; then
+        >&2 echo "/tmp/dtach.pidp10 still exits, failed to stop session"
+        exit 92
+    fi
+}
+
+do_stop () {
+    if ! is_running; then
+        >&2 echo "PiDP-10 is already stopped."
+        status=1
+    else
+        >&2 echo "Stopping PiDP-10"
+        case "$PIDP10_SESSION_PROGRAM" in
+            screen)
+                do_stop_screen
+                ;;
+            tmux)
+                do_stop_tmux
+                ;;
+            dtach)
+                do_stop_dtach
+                ;;
+            *)
+                >&2 echo "Not implemented!"
+                exit 99
+        esac
+    fi
+}
+
+do_stat() {
+    if is_running
+    then
+        >&2 echo "PiDP-10 is up."
+    else
+        >&2 echo "PiDP-10 is down."
+    fi
+}
+
+# Sanity check to ensure the user is not trying to use the standard simh startup
+validate_startup() {
+    if grep pdpcontrol $HOME/.profile >/dev/null; then
+        echo "pdpcontrol found in .profile, aborting"
+        exit 88
+    fi
+    if [ -f "$HOME/.config/wayfire.ini" ] && grep pdpcontrol $HOME/.config/wayfire.ini >/dev/null; then
+        echo "pdpcontrol found in wayfire.ini, aborting"
+        exit 88
+    fi
+}
+
+# ensure the simh boot script doesnt't try to execute additional programs,
+# since with our setup we'll want those to be separate systemd services
+validate_bootscript() {
+    if grep '^!.*tv11' $1 > /dev/null
+    then
+        >&2 echo "Boot script contains tv11 command, aborting"
+        return 1
+    fi
+    if grep '!^.*chaosbridge' $1 > /dev/null
+    then
+        >&2 echo "Boot script contains chaosbridge command, aborting"
+        return 2
+    fi
+    return 0
+}
+
+# function to set the default system to boot
+# valid values are either "scansw", or the a value from the
+# second column in /opt/pidp10/systems/selections
+do_setdefault() {
+    if [[ -z "$1" ]]
+    then
+        echo "Usage: $(basename $0) setdefault <system>"
+        echo
+        echo "Current default: $(cat /opt/pidp10/systems/current)"
+        echo "Valid values:"
+        echo "  scansw"
+        awk '{ print "  " $2 }' /opt/pidp10/systems/selections
+        return 0
+    fi
+
+    if [ "$1" == "scansw" ] || grep "^[0-9][0-9]*\s\s*$1" /opt/pidp10/systems/selections > /dev/null
+    then
+        echo "$1" > /opt/pidp10/systems/current
+        echo "Default system set to $1"
+        return 0
+    else
+        echo "Invalid system name: $1"
+        return 89
+    fi
+}
+
+validate_startup
+
+case "$1" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    status)
+        do_stat
+        ;;
+    setdefault)
+        do_setdefault $2
+        ;;
+    *)
+        echo "Usage: $(basename $0) <start|stop|status|setdefault>"
+        exit 1
+        ;;
+esac

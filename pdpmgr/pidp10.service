@@ -1,0 +1,12 @@
+[Unit]
+Description=PiDP-10 simulator
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/pdpmgr start
+ExecStop=/usr/local/bin/pdpmgr stop
+
+[Install]
+WantedBy=default.target
